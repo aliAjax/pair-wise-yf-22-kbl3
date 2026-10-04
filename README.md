@@ -12,7 +12,61 @@ cp .env.example .env && docker compose up -d
 
 后端健康检查：<http://localhost:21114/health>
 
-后端健康检查：<http://localhost:21114/health>
+所有 `/api/**` 接口需要请求头 `X-Auth-Token`（任意非空）和 `X-Role`（`INSPECTOR` / `LINE_SUPERVISOR` / `QUALITY_MANAGER` / `AUDITOR`）。
+
+```bash
+# 质检员提交检验（逐项写入检验结果，随后重算批次结论）
+curl -X POST http://localhost:21114/api/quality-inspection \
+  -H 'X-Auth-Token: t' -H 'X-Role: INSPECTOR' -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BATCH-2026-001","inspectorId":"u1","inspectionType":"FIRST","standardVersion":"v1","items":[{"itemCode":"DIA","itemName":"直径","measuredValue":"9.98","limitMin":"9.9","limitMax":"10.1","itemStatus":"PASS"}]}'
+
+# 质检员更新单个检验项（同一检验项重复提交只留最新一次，并重算旧结论）
+curl -X POST 'http://localhost:21114/api/inspection-item-result?inspectionId=1' \
+  -H 'X-Auth-Token: t' -H 'X-Role: INSPECTOR' -H 'Content-Type: application/json' \
+  -d '{"itemCode":"DIA","itemName":"直径","measuredValue":"10.2","limitMin":"9.9","limitMax":"10.1","itemStatus":"FAIL"}'
+
+# 质检员登记不良
+curl -X POST http://localhost:21114/api/defect-record \
+  -H 'X-Auth-Token: t' -H 'X-Role: INSPECTOR' -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BATCH-2026-001","defectType":"SCRATCH","defectQty":"2","severity":"MINOR","rootCause":"fixture"}'
+
+# 质量经理关闭不良 / 让步放行（质检员调用会被 403 拒绝）
+curl -X POST http://localhost:21114/api/defect-record/1/close      -H 'X-Auth-Token: t' -H 'X-Role: QUALITY_MANAGER'
+curl -X POST http://localhost:21114/api/defect-record/1/concession -H 'X-Auth-Token: t' -H 'X-Role: QUALITY_MANAGER'
+
+# 重算失败后按批次号重试（保留上一次结论）
+curl -X POST http://localhost:21114/api/product-batch/BATCH-2026-001/conclusion/recompute \
+  -H 'X-Auth-Token: t' -H 'X-Role: QUALITY_MANAGER'
+
+# 全链路追溯：结论与明细同源
+curl http://localhost:21114/api/trace/BATCH-2026-001 -H 'X-Auth-Token: t' -H 'X-Role: AUDITOR'
+```
+
+## 核心 API
+
+| 方法 | 路径 | 说明 | 允许角色 |
+|---|---|---|---|
+| POST | `/api/product-batch` | 创建批次 | INSPECTOR / LINE_SUPERVISOR / QUALITY_MANAGER |
+| GET | `/api/product-batch/{batchNo}` | 批次详情（含结论与版本） | 所有已认证角色 |
+| POST | `/api/product-batch/{batchNo}/conclusion/recompute` | 按批次号重算/重试结论 | INSPECTOR / QUALITY_MANAGER |
+| POST | `/api/quality-inspection` | 提交检验并逐项写入检验结果 | INSPECTOR / QUALITY_MANAGER |
+| POST | `/api/inspection-item-result?inspectionId=` | 录入/更新单个检验项 | INSPECTOR / QUALITY_MANAGER |
+| POST | `/api/defect-record` | 登记不良 | INSPECTOR / QUALITY_MANAGER |
+| POST | `/api/defect-record/{id}/close` | 关闭不良 | QUALITY_MANAGER |
+| POST | `/api/defect-record/{id}/concession` | 让步放行 | QUALITY_MANAGER |
+| GET | `/api/trace/{batchNo}` | 批次全链路追溯树 | 所有已认证角色 |
+
+越权提交一律返回 `403 {"code":"RBAC_DENIED"}`；未认证返回 `401 {"code":"AUTH_REQUIRED"}`。
+
+## 批次结论重算规则
+
+批次结论不再由多次写入拼接，而是每次由 `BatchConclusionService` 按已生效数据整体重算：
+
+- **数据来源**：已生效的检验项结果（同一检验项重复提交只保留最新一次，按 `(inspectionId, itemCode)` 去重）+ 该批次全部不良记录。
+- **触发时机**：提交检验、更新检验项、登记/关闭/让步放行不良，都会立即重算旧结论；结论版本号 `conclusionVersion` 递增。
+- **判定优先级**：任一检验项 FAIL 或存在未关闭的 MAJOR/CRITICAL 不良 → `FAIL`；有 RECHECK 项或尚无检验数据 → `PENDING`；存在让步放行或未关闭的 MINOR 不良 → `CONDITIONAL_PASS`；否则 `PASS`。
+- **并发控制**：同一批次的写入与重算按批次号加锁串行化，同时提交同一批次时只有一次重算生效，其余请求返回 `409 RECOMPUTE_IN_PROGRESS`，客户端可重试。
+- **失败重试**：重算抛错时保留上一次结论（不覆盖），错误记入 `lastRecomputeError`，通过 `POST /api/product-batch/{batchNo}/conclusion/recompute` 按批次号重试。
 
 
 ## 本地开发方式
@@ -55,8 +109,11 @@ backend/src/routes, controllers, services, models, repositories, middlewares, co
 ## 枚举/常量出现位置清单
 
 - WorkOrderStatus: constants/WorkOrderStatus、types/WorkOrderStatus、constructors、logTemplates、errorMessages、筛选器、展示组件/控制器均有引用。
-- InspectionResultStatus: constants/InspectionResultStatus、types/InspectionResultStatus、constructors、logTemplates、errorMessages、筛选器、展示组件/控制器均有引用。
-- DefectSeverity: constants/DefectSeverity、types/DefectSeverity、constructors、logTemplates、errorMessages、筛选器、展示组件/控制器均有引用。
+- InspectionResultStatus: constants/InspectionResultStatus、types/InspectionItemResultPayload、validators/PayloadValidator、services（检验状态推导与批次结论重算）、logTemplates、errorMessages 均有引用。
+- DefectSeverity: constants/DefectSeverity、types/DefectRecordPayload、validators/PayloadValidator、services/BatchConclusionService（MAJOR/CRITICAL 判定）、logTemplates、errorMessages 均有引用。
+- BatchConclusion: constants/BatchConclusion、services/BatchConclusionService、services/ProductBatchService、utils/Formatters（中文文案）、constructors/ProductBatchDtoFactory 均有引用。
+- DispositionStatus: constants/DispositionStatus、services/DefectRecordService（OPEN/CLOSED/CONCESSION）、services/BatchConclusionService 均有引用。
+- Role: constants/Role、middlewares/AuthMiddleware、middlewares/RbacMiddleware、controllers（各写接口角色声明）均有引用。
 
 ## 为什么会牵一发动全身
 
