@@ -1,1 +1,9 @@
-package com.generated.qualityTrace.repositories; import java.util.*; import org.springframework.stereotype.Repository; @Repository public class QualityInspectionRepository { public List<Map<String,Object>> findAll(){ return List.of(Map.of("id",1,"name","质量检验","status","READY")); } }
+package com.generated.qualityTrace.repositories;
+
+import org.apache.ibatis.annotations.Mapper;
+import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+import com.generated.qualityTrace.models.QualityInspection;
+
+@Mapper
+public interface QualityInspectionRepository extends BaseMapper<QualityInspection> {
+}
